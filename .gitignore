@@ -1,0 +1,26 @@
+# Секреты и сессии
+.env
+hh_session.json
+state.json
+resume.txt
+vacancies.xlsx
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Скриншоты отладки
+*.png
+screenshots/
+
+# Lock-файлы редакторов
+.~lock.*
+
+# IDE
+.idea/
+.vscode/
+*.iml
