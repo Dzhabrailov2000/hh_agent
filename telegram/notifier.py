@@ -49,17 +49,46 @@ async def send_hr_notification(
     await _send(text, url_button=("Открыть чат", negotiation_url))
 
 
+
+async def send_chat_summary(
+    auto_replied: list[dict],
+    notified: list[dict],
+) -> None:
+    """Итоговый отчёт после прохода по чатам."""
+    if not auto_replied and not notified:
+        return
+    lines = ["📊 *Итог прохода чатов*\n"]
+    if auto_replied:
+        lines.append(f"*Авто\\-ответы* \\({len(auto_replied)}\\):")
+        for item in auto_replied:
+            lines.append(f"  • {_esc(item['company'])} — {_esc(item['vacancy'])}: _{_esc(item['action'])}_")
+    if notified:
+        if auto_replied:
+            lines.append("")
+        lines.append(f"*Уведомления в TG* \\({len(notified)}\\):")
+        for item in notified:
+            lines.append(f"  • {_esc(item['company'])} — {_esc(item['vacancy'])}: _{_esc(item['reason'])}_")
+    await _send("\n".join(lines))
+
+
 async def send_applied_notification(
     vacancy_title: str,
     employer_name: str,
     vacancy_url: str,
+    screening: list[dict] | None = None,
 ) -> None:
-    """Уведомление об успешном отклике."""
-    text = (
-        f"✅ *Отклик отправлен*\n\n"
-        f"*{_esc(employer_name)}* — {_esc(vacancy_title)}"
-    )
-    await _send(text, url_button=("Открыть вакансию", vacancy_url))
+    """Уведомление об успешном отклике, опционально со скрининговыми ответами."""
+    lines = [
+        f"✅ *Отклик отправлен*\n",
+        f"*{_esc(employer_name)}* — {_esc(vacancy_title)}",
+    ]
+    if screening:
+        lines.append("")
+        for item in screening:
+            q = _esc(item["question"][:120])
+            a = _esc(item["answer"][:300])
+            lines.append(f"❓ _{q}_\n✏️ {a}")
+    await _send("\n".join(lines), url_button=("Открыть вакансию", vacancy_url))
 
 
 async def _send(text: str, url_button: tuple[str, str] | None = None) -> None:

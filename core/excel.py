@@ -77,6 +77,7 @@ def update(state: dict) -> None:
     _build_daily_sheet(wb, state)
     _build_failed_sheet(wb, state)
     _build_quick_reply_sheet(wb, state)
+    _build_screening_sheet(wb, state)
 
     # Удаляем дефолтный лист если не нужен
     if "Sheet" in wb.sheetnames:
@@ -235,6 +236,48 @@ def _build_quick_reply_sheet(wb: Workbook, state: dict) -> None:
             cell.fill = fill
             cell.border = THIN_BORDER
             cell.alignment = Alignment(vertical="center", wrap_text=col in (4, 5, 7))
+
+    ws.freeze_panes = "A2"
+
+
+def _build_screening_sheet(wb: Workbook, state: dict) -> None:
+    ws = wb.create_sheet("Скрининг")
+
+    headers = ["Дата", "Вакансия", "Компания", "Вопрос", "Ответ", "Ссылка"]
+    _apply_header(ws, headers)
+    _set_col_widths(ws, [12, 35, 25, 45, 55, 12])
+
+    SCREENING_FILL = PatternFill("solid", fgColor="EAF4FB")
+
+    journal = state.get("journal", {})
+    entries = sorted(journal.values(), key=lambda e: e.get("applied_at", ""), reverse=True)
+
+    row_num = 2
+    for entry in entries:
+        screening = entry.get("screening", [])
+        if not screening:
+            continue
+        date = _extract_date(entry.get("applied_at", ""))
+        title = entry.get("title", "")
+        company = entry.get("company", "")
+        url = entry.get("url", "")
+
+        for item in screening:
+            ws.cell(row=row_num, column=1, value=date)
+            ws.cell(row=row_num, column=2, value=title)
+            ws.cell(row=row_num, column=3, value=company)
+            ws.cell(row=row_num, column=4, value=item.get("question", ""))
+            ws.cell(row=row_num, column=5, value=item.get("answer", ""))
+            if url:
+                cell = ws.cell(row=row_num, column=6, value="Открыть")
+                cell.hyperlink = url
+                cell.font = Font(color="0563C1", underline="single")
+            for col in range(1, 7):
+                cell = ws.cell(row=row_num, column=col)
+                cell.fill = SCREENING_FILL
+                cell.border = THIN_BORDER
+                cell.alignment = Alignment(vertical="center", wrap_text=col in (4, 5))
+            row_num += 1
 
     ws.freeze_panes = "A2"
 

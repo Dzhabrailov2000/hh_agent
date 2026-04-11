@@ -15,10 +15,13 @@ HH.ru Job Agent — главный цикл (Playwright-версия).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import sys
+import shutil
 import argparse
 from datetime import datetime
+from pathlib import Path
 
 # load_dotenv() должен быть ДО импорта matcher/responder,
 # иначе Anthropic-клиент инициализируется без API ключа
@@ -43,12 +46,11 @@ from config import (
 from browser.client import HHBrowserClient
 from ai.matcher import score_vacancy
 from ai.responder import generate_response, is_human_hr, classify_quick_reply
-from telegram.notifier import send_hr_notification, send_applied_notification
+from telegram.notifier import send_hr_notification, send_applied_notification, send_chat_summary
 from telegram.bot import run_bot
 from core.state import load_state, save_state
 from core.excel import update as update_excel
-
-load_dotenv()
+from core.exceptions import StopOnFail
 
 
 MAX_APPLY_ATTEMPTS = 3
@@ -62,6 +64,7 @@ async def _do_apply(
     full: dict,
     score: int,
     applied_ids: set,
+    stop_on_fail: bool = False,
 ) -> None:
     """Выполняет отклик и обновляет state. При ошибке — записывает в failed_apply."""
     title = full.get("name", "?")
@@ -80,12 +83,16 @@ async def _do_apply(
 
         if result == "applied":
             print(f"    → ✓ Отклик отправлен")
+            screening = client._last_screening_answers
+            client._last_screening_answers = []
         elif result == "already_applied":
             print(f"    → уже откликались")
         elif result == "error":
             print(f"    → ✗ Ошибка отклика: {reason}")
             _save_failed(state, vid, title, company, url, score, reason, screenshot)
             save_state(state)
+            if stop_on_fail:
+                raise StopOnFail(f"{title} @ {company}: {reason}")
             return  # НЕ добавляем в applied — ретраим на следующем цикле
         else:
             print(f"    → ✗ Неизвестный результат: {result}")
@@ -103,21 +110,25 @@ async def _do_apply(
             "score": score,
             "status": "applied",
             "hr_messages": [],
+            "screening": screening or [],
         }
         save_state(state)
 
-        if result == "applied":
+        if result == "applied" and not dry_run:
             try:
                 await send_applied_notification(
                     vacancy_title=title,
                     employer_name=company,
                     vacancy_url=url,
+                    screening=screening,
                 )
             except Exception as tg_err:
                 print(f"    ⚠ Telegram: {tg_err}")
 
         await asyncio.sleep(2)
 
+    except StopOnFail:
+        raise
     except Exception as e:
         print(f"    → ✗ Исключение: {e}")
         _save_failed(state, vid, title, company, url, score, str(e), "")
@@ -201,7 +212,7 @@ async def _retry_failed(
 # ---------------------------------------------------------------------------
 
 async def run_apply_step(
-    client: HHBrowserClient, state: dict, dry_run: bool
+    client: HHBrowserClient, state: dict, dry_run: bool, stop_on_fail: bool = False
 ) -> None:
     print(f"\n[{now()}] Поиск вакансий по {len(SEARCH_QUERIES)} запросам...")
 
@@ -213,6 +224,7 @@ async def run_apply_step(
             schedule=SCHEDULE,
             salary_from=SALARY_FROM,
             per_page=VACANCIES_PER_RUN,
+            experience_list=EXPERIENCE,
         )
     else:
         seen_ids: set = set()
@@ -247,18 +259,6 @@ async def run_apply_step(
         if vid in applied_ids:
             continue
 
-        # Фильтр по названию из результатов поиска — ДО открытия страницы
-        title_lower = v.get("name", "").lower()
-
-        # Только Java/Kotlin разработчики
-        if not any(kw in title_lower for kw in ("java", "kotlin")):
-            print(f"  [--] {v.get('name', '?')} — не java/kotlin")
-            continue
-
-        if any(kw.lower() in title_lower for kw in TITLE_BLACKLIST):
-            print(f"  [--] {v.get('name', '?')} — пропущено по blacklist")
-            continue
-
         # Загружаем полную карточку вакансии
         try:
             full = await client.get_vacancy_details(v["url"])
@@ -272,38 +272,52 @@ async def run_apply_step(
             save_state(state)
             continue
 
-        # Повторная проверка по полному названию из детальной страницы
-        title_lower = full.get("name", "").lower()
-        if any(kw.lower() in title_lower for kw in TITLE_BLACKLIST):
-            print(f"  [--] {full.get('name', '?')} — пропущено по blacklist")
-            continue
-
-        # Фильтр по компании
-        company_lower = full.get("employer", {}).get("name", "").lower()
-        if any(kw.lower() in company_lower for kw in COMPANY_BLACKLIST):
-            print(f"  [--] {full.get('name', '?')} @ {full.get('employer', {}).get('name', '?')} — пропущено по company blacklist")
-            continue
-
-        # Оцениваем релевантность через Claude
-        try:
-            score, reason = score_vacancy(RESUME, full)
-        except Exception as e:
-            print(f"  ⚠ Вакансия {vid}: ошибка оценки — {e}")
-            continue
-
         company = full.get("employer", {}).get("name", "?")
         title = full.get("name", "?")
-        print(f"  [{score}/10] {title} @ {company}")
-        print(f"         {reason}")
+        title_lower = title.lower()
+        desc_lower = (full.get("description", "") + " ".join(
+            s.get("name", "") for s in full.get("key_skills", [])
+        )).lower()
 
-        if score < MIN_RELEVANCE_SCORE:
+        # Фильтр по компании (Сбер, Яндекс и пр.)
+        if any(kw.lower() in company.lower() for kw in COMPANY_BLACKLIST):
+            print(f"  [--] {title} @ {company} — company blacklist")
             continue
+
+        # --- Проверка по описанию: Java/Kotlin backend ---
+
+        # 1. Должен быть Java или Kotlin (в названии или описании)
+        has_java = "java" in title_lower or "java" in desc_lower
+        has_kotlin = "kotlin" in title_lower or "kotlin" in desc_lower
+        if not has_java and not has_kotlin:
+            print(f"  [--] {title} — нет Java/Kotlin")
+            continue
+
+        # 2. Не QA / автоматизация тестирования
+        qa_keywords = (
+            "qa ", "qа ", "quality assurance", "тестировщик", "тестировани",
+            "автоматизатор", "automation test", "aqa", "aqа",
+        )
+        if any(kw in title_lower for kw in qa_keywords):
+            print(f"  [--] {title} — QA/тестирование")
+            continue
+
+        # 3. Не фронтенд-heavy fullstack (когда фронт — основной стек)
+        frontend_primary = ("react developer", "vue developer", "angular developer",
+                            "frontend developer", "фронтенд разработчик",
+                            "fullstack (react", "fullstack (vue", "full stack (react")
+        if any(kw in title_lower for kw in frontend_primary):
+            print(f"  [--] {title} — фронтенд/fullstack")
+            continue
+
+        score = 0
+        print(f"  [→] {title} @ {company}")
 
         if dry_run:
             print(f"    → [dry-run] отклик пропущен")
             continue
 
-        await _do_apply(client, state, v["url"], vid, full, score, applied_ids)
+        await _do_apply(client, state, v["url"], vid, full, score, applied_ids, stop_on_fail=stop_on_fail)
         new_applied += sum(1 for _ in [None] if vid in state["journal"] and state["journal"][vid]["status"] == "applied")
 
     # Ретрай ранее упавших откликов (до 3 попыток)
@@ -332,8 +346,10 @@ async def run_chat_step(
         return
 
     print(f"  Переговоров: {len(negotiations)}")
-    notified_set = set(state["notified_messages"])
+    chat_last_seen: dict = state.setdefault("chat_last_seen", {})
     new_notifications = 0
+    summary_auto: list[dict] = []
+    summary_notified: list[dict] = []
 
     for neg in negotiations:
         neg_url = neg["url"]
@@ -343,22 +359,27 @@ async def run_chat_step(
         employer_name = neg.get("employer", {}).get("name", "?")
 
         try:
-            messages, chat_locked, quick_replies = await client.get_messages(neg_url, tab_url=neg_tab)
+            messages, chat_locked, quick_replies = await client.get_messages(neg_id, tab_url=neg_tab)
         except Exception as e:
             print(f"  ⚠ Чат {neg_id}: {e}")
             continue
 
         if not messages:
+            print(f"  [пусто] {vacancy_name} @ {employer_name}")
             continue
 
         last = messages[-1]
-        last_id = last["id"]
         last_author = last.get("author", {}).get("participant_type", "")
 
-        # Обрабатываем только сообщения от HR, которые ещё не обработаны
-        if last_author != "employer":
+        # Пропускаем если последнее сообщение от соискателя (т.е. от нас)
+        if last_author not in ("employer", ""):
+            print(f"  [наше] {vacancy_name} @ {employer_name} — последнее сообщение наше")
             continue
-        if last_id in notified_set:
+
+        # Проверяем: уже обрабатывали это конкретное сообщение?
+        last_text_hash = hashlib.md5(last["text"].encode()).hexdigest()
+        if chat_last_seen.get(neg_id) == last_text_hash:
+            print(f"  [уже] {vacancy_name} @ {employer_name} — уже обработали")
             continue
 
         if chat_locked and not quick_replies:
@@ -382,7 +403,7 @@ async def run_chat_step(
             entry = state["journal"][vid]
             entry["status"] = "human_hr" if human else "hr_contacted"
             entry["hr_messages"].append({
-                "id": last_id,
+                "id": last.get("id", last_text_hash),
                 "text": last["text"],
                 "at": now(),
             })
@@ -394,7 +415,7 @@ async def run_chat_step(
             # Скриншот до нажатия — для лога
             shot_path = f"screenshots/qr_{neg_id}_{now()[:10]}.png"
             try:
-                await client.screenshot_chat(neg_url, shot_path, tab_url=neg_tab)
+                await client.screenshot_chat(neg_id, shot_path, tab_url=neg_tab)
             except Exception:
                 shot_path = ""
 
@@ -427,6 +448,7 @@ async def run_chat_step(
                     try:
                         await client.click_quick_reply(neg_url, value, tab_url=neg_tab)
                         print(f"    → ✓ Кнопка нажата")
+                        summary_auto.append({"company": employer_name, "vacancy": vacancy_name, "action": f"кнопка «{value}»"})
                         await asyncio.sleep(1.5)
                     except Exception as e:
                         print(f"    → ✗ {e}")
@@ -445,6 +467,7 @@ async def run_chat_step(
                             negotiation_url=neg_url,
                         )
                         print(f"    → ✓ Уведомление отправлено в Telegram")
+                        summary_notified.append({"company": employer_name, "vacancy": vacancy_name, "reason": value})
                         new_notifications += 1
                     except Exception as e:
                         print(f"    → ✗ Telegram: {e}")
@@ -463,6 +486,7 @@ async def run_chat_step(
                         negotiation_url=neg_url,
                     )
                     print(f"    → ✓ Уведомление отправлено в Telegram")
+                    summary_notified.append({"company": employer_name, "vacancy": vacancy_name, "reason": "живой HR"})
                     new_notifications += 1
                 except Exception as e:
                     print(f"    → ✗ Telegram: {e}")
@@ -483,15 +507,23 @@ async def run_chat_step(
                     try:
                         await client.send_message(neg_url, answer, tab_url=neg_tab)
                         print(f"    → ✓ Ответ отправлен")
+                        summary_auto.append({"company": employer_name, "vacancy": vacancy_name, "action": "AI-ответ"})
                         await asyncio.sleep(1.5)
                     except Exception as e:
                         print(f"    → ✗ {e}")
 
-        notified_set.add(last_id)
-        state["notified_messages"] = list(notified_set)
+        chat_last_seen[neg_id] = last_text_hash
+        state["chat_last_seen"] = chat_last_seen
         save_state(state)
 
     print(f"  Новых уведомлений: {new_notifications}")
+
+    # Итоговый отчёт в Telegram
+    if not dry_run and (summary_auto or summary_notified):
+        try:
+            await send_chat_summary(summary_auto, summary_notified)
+        except Exception as e:
+            print(f"  ⚠ Ошибка отправки итога в Telegram: {e}")
 
 
 def _find_vacancy_id_by_neg(
@@ -517,6 +549,12 @@ async def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--once", action="store_true")
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--visible", action="store_true", help="Показывать браузер во время работы")
+    parser.add_argument("--stop-on-fail", action="store_true", help="Остановить процесс при первой ошибке отклика")
+    parser.add_argument(
+        "--mode", choices=["apply", "chat", "both"], default="both",
+        help="apply — только отклики; chat — только чаты; both — всё вместе (по умолчанию)"
+    )
     args = parser.parse_args()
 
     hh_login = os.environ.get("HH_LOGIN")
@@ -530,33 +568,60 @@ async def main():
         print("Ошибка: задайте ANTHROPIC_API_KEY в .env")
         sys.exit(1)
 
-    # Первый запуск — браузер видимый (нужен для логина)
-    headless = args.headless and Path("hh_session.json").exists()
-    client = HHBrowserClient(headless=headless)
-
     bot_task = asyncio.create_task(run_bot())
+
+    # --visible: сразу открываем браузер видимым
+    # По умолчанию: тихий режим (headless), браузер открывается только если нужен логин
+    force_visible = args.visible
+    mode = args.mode
+
+    # Если режим apply/chat — копируем базовый профиль если целевой не существует
+    if mode in ("apply", "chat"):
+        src = Path("hh_browser_profile")
+        dst = Path(f"hh_browser_profile_{mode}")
+        if src.exists() and not dst.exists():
+            print(f"  Копирую профиль браузера в {dst}...")
+            shutil.copytree(str(src), str(dst))
+
+    # Интервалы: отклики каждые 30 мин, чаты каждые 5 мин
+    APPLY_INTERVAL = CHECK_INTERVAL_MINUTES * 60
+    CHAT_INTERVAL = 5 * 60
+
+    client = HHBrowserClient(headless=not force_visible, mode=mode)
 
     try:
         await client.start()
+        logged_in = await client.is_logged_in()
 
-        # Проверяем / выполняем логин
-        if not await client.is_logged_in():
-            print("Сессия не найдена — выполняется вход...")
+        if not logged_in:
+            if force_visible:
+                print("Войдите в браузере вручную...")
+            else:
+                await client.close()
+                print("Сессия не найдена — открываю браузер для входа...")
+                client = HHBrowserClient(headless=False, mode=mode)
+                await client.start()
             if not await client.login(hh_login, hh_password):
                 print("Не удалось войти. Проверьте логин/пароль.")
                 return
         else:
-            print("✓ Сессия активна")
+            print("✓ Сессия активна" + ("" if force_visible else ", браузер работает в фоне"))
 
         if args.dry_run:
             print("[DRY RUN] Режим анализа без отправки\n")
+
+        mode_label = {"apply": "откликов", "chat": "чатов", "both": "откликов + чатов"}[mode]
+        interval = CHAT_INTERVAL if mode == "chat" else APPLY_INTERVAL
+        print(f"  Режим: {mode_label}, интервал: {interval // 60} мин")
 
         state = load_state()
 
         while True:
             try:
-                await run_apply_step(client, state, dry_run=args.dry_run)
-                await run_chat_step(client, state, dry_run=args.dry_run)
+                if mode in ("apply", "both"):
+                    await run_apply_step(client, state, dry_run=args.dry_run, stop_on_fail=args.stop_on_fail)
+                if mode in ("chat", "both"):
+                    await run_chat_step(client, state, dry_run=args.dry_run)
                 try:
                     update_excel(state)
                     print(f"  📊 Excel обновлён: vacancies.xlsx")
@@ -564,15 +629,18 @@ async def main():
                     print(f"  ⚠ Excel: {e}")
             except KeyboardInterrupt:
                 break
+            except StopOnFail as e:
+                print(f"\n🛑 Остановка по --stop-on-fail: {e}")
+                break
             except Exception as e:
                 print(f"\n⚠ Ошибка цикла: {e}")
 
             if args.once:
                 break
 
-            print(f"\n  Следующий запуск через {CHECK_INTERVAL_MINUTES} мин. Ctrl+C для остановки.")
+            print(f"\n  Следующий запуск через {interval // 60} мин. Ctrl+C для остановки.")
             try:
-                await asyncio.sleep(CHECK_INTERVAL_MINUTES * 60)
+                await asyncio.sleep(interval)
             except (KeyboardInterrupt, asyncio.CancelledError):
                 break
 

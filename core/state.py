@@ -16,6 +16,7 @@ def load_state() -> dict:
         state = {}
     state.setdefault("applied", [])
     state.setdefault("notified_messages", [])
+    state.setdefault("chat_last_seen", {})
     state.setdefault("journal", {})
     state.setdefault("failed_apply", {})
     state.setdefault("quick_reply_log", [])

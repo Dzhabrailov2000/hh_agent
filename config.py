@@ -21,7 +21,7 @@ SEARCH_QUERIES = [
 ]
 SEARCH_QUERY = SEARCH_QUERIES[0]  # используется как дефолт в совместимых местах
 SEARCH_AREA = 1          # 1 = Москва
-EXPERIENCE = "between3And6"  # от 3 лет опыта
+EXPERIENCE = ["between3And6", "moreThan6"]  # от 3 лет опыта
 SALARY_FROM = 350000     # от 350 000 руб.
 SCHEDULE = "remote"      # только удалённая работа
 VACANCIES_PER_RUN = 50   # вакансий за один запрос
@@ -30,7 +30,7 @@ VACANCIES_PER_RUN = 50   # вакансий за один запрос
 USE_RECOMMENDATIONS = True
 
 # --- Фильтрация ---
-MIN_RELEVANCE_SCORE = 3  # порог релевантности 1–10 (включительно)
+MIN_RELEVANCE_SCORE = 0  # 0 = откликаемся на все рекомендации без фильтра по оценке
 
 # Вакансии с этими словами в названии пропускаются без оценки Claude
 TITLE_BLACKLIST = [
@@ -62,6 +62,7 @@ COMPANY_BLACKLIST = [
     "сбер", "сбербанк", "sber", "сберкорус", "сберлог",
     "сберавто", "сбертех", "сберзвук", "сберздоровье",
     "сберфуд", "сберинфра", "сберcloud", "сберобразование",
+    "яндекс", "yandex",
 ]
 
 # --- Интервал опроса ---
@@ -69,10 +70,13 @@ CHECK_INTERVAL_MINUTES = 30
 
 # --- Сообщение при отклике ---
 COVER_LETTER = (
-    "Здравствуйте! Ваша вакансия меня заинтересовала — "
-    "у меня 3+ года опыта в backend-разработке на Java/Kotlin. "
-    "Сейчас работаю Senior Kotlin разработчиком в highload-команде AliExpress (Kotlin, Spring Boot, Kafka, k8s). "
-    "До этого 2,5 года разрабатывал mission-critical банковские сервисы в Raiffeisenbank. "
+    "Здравствуйте! Ваша вакансия меня заинтересовала.\n\n"
+    "6 лет в backend-разработке на Java/Kotlin. Сейчас — Senior Kotlin Developer в AliExpress Россия: "
+    "проектирую высоконагруженные сервисы промо-движка (Kotlin, Spring Boot 3, Coroutines, Kafka, Redis, k8s). "
+    "До этого 2,5 года в Raiffeisenbank — mission-critical инвестиционные сервисы Capital Market "
+    "(Java 17/21, Spring Boot 3, Kafka, IBM MQ, PostgreSQL).\n\n"
+    "Опыт в DDD, Clean Architecture, TDD, code review, наставничество middle/junior-разработчиков. "
+    "Ищу удалённую позицию Senior Java/Kotlin Developer.\n\n"
     "Готов обсудить детали в удобное для вас время."
 )
 

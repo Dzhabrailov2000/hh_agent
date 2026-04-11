@@ -1,6 +1,9 @@
 # Секреты и сессии
 .env
 hh_session.json
+hh_browser_profile/
+hh_browser_profile_apply/
+hh_browser_profile_chat/
 state.json
 resume.txt
 vacancies.xlsx

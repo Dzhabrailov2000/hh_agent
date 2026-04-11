@@ -16,7 +16,17 @@ from typing import Optional
 from playwright.async_api import async_playwright, Page, BrowserContext, Playwright
 
 SESSION_FILE = Path("hh_session.json")
+PROFILE_DIR = Path("hh_browser_profile")
 BASE_URL = "https://hh.ru"
+
+
+def get_profile_dir(mode: str = "default") -> Path:
+    """Возвращает путь к профилю браузера для заданного режима."""
+    if mode == "apply":
+        return Path("hh_browser_profile_apply")
+    if mode == "chat":
+        return Path("hh_browser_profile_chat")
+    return PROFILE_DIR
 
 
 async def _delay(min_ms: int = 600, max_ms: int = 2000):
@@ -24,25 +34,41 @@ async def _delay(min_ms: int = 600, max_ms: int = 2000):
     await asyncio.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
 
 
+def _clean_vacancy_url(url: str) -> str:
+    """Оставляет только путь /vacancy/<id> без tracking-параметров."""
+    m = re.search(r"(https?://[^/]+/vacancy/\d+)", url)
+    return m.group(1) if m else url
+
+
 class HHBrowserClient:
-    def __init__(self, headless: bool = False):
+    def __init__(self, headless: bool = False, mode: str = "default"):
         """
         headless=False — браузер виден (нужно для первого логина и CAPTCHA).
         headless=True — фоновый режим после сохранения сессии.
+        mode — 'apply', 'chat', или 'default' — определяет папку профиля.
         """
         self.headless = headless
+        self.mode = mode
         self._pw: Optional[Playwright] = None
         self._ctx: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
+        self._last_screening_answers: list[dict] = []
 
     async def start(self):
         self._pw = await async_playwright().start()
-        browser = await self._pw.chromium.launch(
+        profile_dir = get_profile_dir(self.mode)
+        profile_dir.mkdir(exist_ok=True)
+
+        # Удаляем файлы блокировки Chromium — могут остаться после некорректного завершения
+        for lock_file in ["SingletonLock", "SingletonCookie", "SingletonSocket"]:
+            (profile_dir / lock_file).unlink(missing_ok=True)
+
+        # launch_persistent_context сохраняет cookies + sessionStorage + localStorage
+        # между запусками — логиниться нужно только один раз
+        self._ctx = await self._pw.chromium.launch_persistent_context(
+            user_data_dir=str(profile_dir),
             headless=self.headless,
             args=["--disable-blink-features=AutomationControlled"],
-        )
-
-        ctx_kwargs = dict(
             viewport={"width": 1280, "height": 800},
             locale="ru-RU",
             user_agent=(
@@ -51,17 +77,7 @@ class HHBrowserClient:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
         )
-        if SESSION_FILE.exists():
-            try:
-                # Playwright принимает путь к файлу (str) или dict
-                data = json.loads(SESSION_FILE.read_text())
-                ctx_kwargs["storage_state"] = data
-            except Exception:
-                # Битый файл — игнорируем, залогинимся заново
-                SESSION_FILE.unlink(missing_ok=True)
-
-        self._ctx = await browser.new_context(**ctx_kwargs)
-        self.page = await self._ctx.new_page()
+        self.page = self._ctx.pages[0] if self._ctx.pages else await self._ctx.new_page()
         self.page.set_default_timeout(60000)  # 60 сек на все операции
 
         # Скрываем признаки Playwright
@@ -69,11 +85,23 @@ class HHBrowserClient:
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
         """)
 
+        # Закрываем диалог "Восстановить страницы?" если появился
+        try:
+            restore_btn = self.page.get_by_text("Восстановить", exact=True)
+            close_btn = self.page.locator("[aria-label='Close'], [title='Close'], button:has-text('×'), button:has-text('✕')").first
+            # Ищем крестик диалога восстановления
+            dismiss = self.page.locator("button[class*='close'], [data-testid='close']").first
+            if await dismiss.is_visible(timeout=2000):
+                await dismiss.click()
+            elif await close_btn.is_visible(timeout=1000):
+                await close_btn.click()
+        except Exception:
+            pass
+
     async def save_session(self):
-        if not self._ctx:
-            return
-        state = await self._ctx.storage_state()
-        SESSION_FILE.write_text(json.dumps(state))
+        # Профиль сохраняется автоматически через persistent context.
+        # Метод оставлен для совместимости с вызовами по коду.
+        pass
 
     # -------------------------------------------------------------------------
     # Авторизация
@@ -96,8 +124,11 @@ class HHBrowserClient:
         if "/account/login" in self.page.url:
             return False
 
-        # Если остались на /applicant/ — авторизованы
-        if "/applicant/" in self.page.url:
+        # Позитивная проверка: карточка резюме /resume/<hash> есть только у авторизованного соискателя
+        resume_card = await self.page.locator(
+            "a[href*='/resume/']"
+        ).count()
+        if resume_card > 0:
             await self.save_session()
             return True
 
@@ -114,34 +145,25 @@ class HHBrowserClient:
             print("✓ Авторизация успешна (редирект)")
             return True
 
-        # Поле логина
-        await self.page.get_by_placeholder(re.compile("Телефон|почта|Email", re.I)).fill(login)
-        await _delay(400, 800)
+        # Ждём ручного входа — даём 3 минуты
+        print("\n" + "="*50)
+        print("  Войдите вручную в открытом браузере.")
+        print("  Введите телефон, пароль/SMS и нажмите «Войти».")
+        print("  Ожидание до 3 минут...")
+        print("="*50 + "\n")
 
-        # Кнопка «Продолжить» или «Войти»
-        btn = self.page.get_by_role("button", name=re.compile("Продолжить|Войти", re.I))
-        await btn.first.click()
-        await _delay(1000, 2000)
+        deadline = 180  # секунд
+        interval = 2
+        elapsed = 0
+        while elapsed < deadline:
+            await asyncio.sleep(interval)
+            elapsed += interval
+            if "/account/login" not in self.page.url:
+                await self.save_session()
+                print("✓ Авторизация успешна")
+                return True
 
-        # Поле пароля (может появиться после первого шага)
-        pwd_input = self.page.get_by_placeholder(re.compile("Пароль", re.I))
-        try:
-            await pwd_input.wait_for(state="visible", timeout=5000)
-            await pwd_input.fill(password)
-            await _delay(400, 800)
-            await self.page.get_by_role("button", name=re.compile("Войти", re.I)).last.click()
-        except Exception:
-            pass  # Если пароль уже на первом экране
-
-        await self.page.wait_for_load_state("networkidle", timeout=20000)
-        await self._handle_captcha()
-
-        if "/account/login" not in self.page.url:
-            await self.save_session()
-            print("✓ Авторизация успешна")
-            return True
-
-        print("✗ Не удалось войти — проверьте логин/пароль")
+        print("✗ Время ожидания истекло — войти не удалось")
         return False
 
     # -------------------------------------------------------------------------
@@ -152,15 +174,19 @@ class HHBrowserClient:
         self,
         text: str,
         area: int = 113,
-        experience: str = "between3And6",
+        experience: str | list = "between3And6",
         salary_from: int = 0,
         schedule: str = None,
         page_num: int = 0,
         per_page: int = 20,
     ) -> list[dict]:
         """Поиск вакансий. Возвращает список базовой информации."""
+        if isinstance(experience, list):
+            exp_params = "&".join(f"experience={e}" for e in experience)
+        else:
+            exp_params = f"experience={experience}"
         params = (
-            f"text={text}&area={area}&experience={experience}"
+            f"text={text}&area={area}&{exp_params}"
             f"&page={page_num}&per_page={per_page}"
         )
         if schedule:
@@ -203,10 +229,11 @@ class HHBrowserClient:
                 if await sal_el.count():
                     salary_text = await sal_el.first.inner_text()
 
+                full_url = href if href.startswith("http") else f"{BASE_URL}{href}"
                 results.append({
                     "id": vid_match.group(1),
                     "name": title.strip(),
-                    "url": href if href.startswith("http") else f"{BASE_URL}{href}",
+                    "url": _clean_vacancy_url(full_url),
                     "employer": {"name": company.strip()},
                     "salary_text": salary_text.strip(),
                 })
@@ -220,10 +247,12 @@ class HHBrowserClient:
         schedule: str = "remote",
         salary_from: int = 0,
         per_page: int = 50,
+        experience_list: list[str] | None = None,
     ) -> list[dict]:
         """
         Собирает все рекомендованные вакансии для резюме.
         Открывает страницу резюме, берёт ссылку 'N вакансий', добавляет фильтры.
+        Делает два прохода: experience=between3And6 и experience=moreThan6.
         """
         await self.page.goto(f"{BASE_URL}/applicant/resumes", wait_until="domcontentloaded")
         await _delay(1500, 2500)
@@ -250,81 +279,58 @@ class HHBrowserClient:
             print("  ⚠ Не удалось найти ссылку на рекомендованные вакансии")
             return []
 
-        # Добавляем area=1 (Москва) и per_page
+        # Только per_page — area не нужен для удалённых вакансий
         sep = "&" if "?" in rec_url else "?"
-        rec_url += f"{sep}area=1&per_page={per_page}"
+        rec_url += f"{sep}per_page={per_page}"
 
-        # Загружаем первую страницу и кликаем фильтр "Удалённо" (Формат работы)
-        await self.page.goto(rec_url, wait_until="domcontentloaded")
-        await _delay(1500, 2500)
-        await self._handle_captcha()
+        # Два прохода по опыту: 3-6 лет и 6+ лет
+        if experience_list is None:
+            experience_list = ["between3And6", "moreThan6"]
 
-        if schedule:
-            try:
-                cb = self.page.locator(
-                    f"input[name='work_format'][value='{schedule.upper()}']"
-                ).first
-                if await cb.count() and not await cb.is_checked():
-                    await cb.click()
-                    await _delay(1500, 2500)
-                    print(f"    ✓ Фильтр 'Формат работы: {schedule}' применён")
-            except Exception as e:
-                print(f"    ⚠ Не удалось применить фильтр remote: {e}")
-
-        if salary_from:
-            try:
-                salary_input = self.page.locator(
-                    "input[data-qa='novafilters-custom-compensation']"
-                ).first
-                if await salary_input.count() and await salary_input.is_visible(timeout=2000):
-                    await salary_input.click(click_count=3)
-                    await salary_input.fill(str(salary_from))
-                    await salary_input.press("Enter")
-                    await _delay(1500, 2500)
-                    print(f"    ✓ Фильтр 'Зарплата от {salary_from:,}' применён")
-            except Exception as e:
-                print(f"    ⚠ Не удалось применить фильтр зарплаты: {e}")
-
-        # Узнаём актуальный URL после применения фильтра (для пагинации)
-        filtered_url = self.page.url
-        print(f"    URL рекомендаций: {filtered_url}")
+        # Два порядка сортировки — чтобы получить больше уникальных вакансий
+        # (hh.ru отдаёт ~160 результатов на запрос, разные сортировки дают разные наборы)
+        sort_orders = ["relevance", "publication_time"]
 
         all_results: list[dict] = []
         seen_ids: set = set()
 
-        # Первая страница уже загружена
-        page_results = await self._scrape_vacancy_cards()
-        for v in page_results:
-            if v["id"] not in seen_ids:
-                seen_ids.add(v["id"])
-                all_results.append(v)
-        print(f"    [рекомендации] стр.1: {len(page_results)} вакансий")
+        for exp in experience_list:
+            for order in sort_orders:
+                # Строим URL с фильтрами удалёнки, опыта и сортировки
+                exp_url = rec_url
+                if schedule:
+                    exp_url += f"&work_format={schedule.upper()}"
+                exp_url += f"&experience={exp}&order_by={order}"
 
-        # Пагинация — кликаем номера страниц
-        page_num = 2
-        while len(page_results) >= per_page:
-            try:
-                next_page_btn = self.page.locator(
-                    f"[data-qa='pager-page']:has-text('{page_num}')"
-                ).first
-                if not await next_page_btn.is_visible(timeout=2000):
-                    break
-                await next_page_btn.click()
-                await _delay(1500, 2500)
-                await self._handle_captcha()
-            except Exception:
-                break
+                print(f"\n  → Проход: experience={exp}, sort={order}")
 
-            page_results = await self._scrape_vacancy_cards()
-            for v in page_results:
-                if v["id"] not in seen_ids:
-                    seen_ids.add(v["id"])
-                    all_results.append(v)
-            print(f"    [рекомендации] стр.{page_num}: {len(page_results)} вакансий")
-            page_num += 1
-            if len(page_results) < per_page:
-                break
+                # Пагинация через URL (&page=0, &page=1, ...)
+                page_idx = 0
+                while True:
+                    page_url = f"{exp_url}&page={page_idx}"
+                    await self.page.goto(page_url, wait_until="domcontentloaded")
+                    await _delay(1500, 2500)
+                    await self._handle_captcha()
 
+                    page_results = await self._scrape_vacancy_cards()
+                    if not page_results:
+                        break  # пустая страница — конец
+
+                    new_count = 0
+                    for v in page_results:
+                        if v["id"] not in seen_ids:
+                            seen_ids.add(v["id"])
+                            all_results.append(v)
+                            new_count += 1
+                    print(f"    стр.{page_idx + 1}: {len(page_results)} вакансий ({new_count} новых)")
+
+                    # Все вакансии страницы уже видели — дальше нет смысла
+                    if new_count == 0:
+                        break
+
+                    page_idx += 1
+
+        print(f"\n  Итого рекомендаций (уникальных): {len(all_results)}")
         return all_results
 
     async def get_vacancy_details(self, vacancy_url: str) -> dict:
@@ -350,7 +356,7 @@ class HHBrowserClient:
             details["salary_text"] = await sal_el.inner_text()
 
         # Описание (уже без HTML — innerText)
-        desc_el = self.page.locator("[data-qa='vacancy-description']")
+        desc_el = self.page.locator("[data-qa='vacancy-description']").first
         if await desc_el.count():
             details["description"] = await desc_el.inner_text()
 
@@ -383,6 +389,7 @@ class HHBrowserClient:
         """
         import os
 
+        vacancy_url = _clean_vacancy_url(vacancy_url)
         await self.page.goto(vacancy_url, wait_until="domcontentloaded")
         await _delay(1200, 2000)
 
@@ -415,27 +422,51 @@ class HHBrowserClient:
         await _delay(2000, 3000)
         await self.page.screenshot(path=f"screenshots/apply_{tag}_step1.png")
 
-        # --- Попап «Сколько хотите получать» (после успешного отклика) ---
-        # Появляется уже ПОСЛЕ отклика — просто закрываем крестиком
+        # --- Попап / форма «Сколько хотите получать» ---
+        # Может появиться как шаг формы отклика (обязательный) или после отклика (опциональный).
+        # В любом случае заполняем поле и жмём «Продолжить».
         try:
-            salary_popup_close = self.page.locator("button[aria-label='Закрыть'], [data-qa='modal-close'], button.bloko-modal-close").first
-            if await salary_popup_close.is_visible(timeout=2000):
-                await salary_popup_close.click()
-                await _delay(500, 800)
+            from config import SALARY_FROM
+            salary_field = self.page.locator(
+                "input[data-qa*='salary'], "
+                "input[placeholder*='зарплат' i], "
+                "input[placeholder*='сумм' i], "
+                "input[name*='salary'], "
+                "input[type='number'][data-qa*='compensation']"
+            ).first
+            if await salary_field.is_visible(timeout=2000):
+                await salary_field.click(click_count=3)
+                await salary_field.fill(str(SALARY_FROM))
+                await _delay(400, 700)
+                print(f"    → Заполнена желаемая зарплата: {SALARY_FROM:,}")
+                # Жмём «Сохранить и продолжить» или «Продолжить»
+                for btn_name in ["Сохранить и продолжить", "Продолжить", "Далее"]:
+                    btn = self.page.get_by_role("button", name=re.compile(btn_name, re.I)).first
+                    if await btn.is_visible(timeout=1000):
+                        await btn.click()
+                        await _delay(800, 1200)
+                        break
             else:
-                # Пробуем закрыть через «Сохранить и продолжить» без заполнения
-                save_continue = self.page.get_by_role("button", name=re.compile("Сохранить и продолжить", re.I))
-                if await save_continue.first.is_visible(timeout=1000):
-                    await save_continue.first.click()
-                    await _delay(500, 800)
+                # Попап без поля ввода (просто информационный) — закрываем
+                close_btn = self.page.locator(
+                    "button[aria-label='Закрыть'], [data-qa='modal-close'], button.bloko-modal-close"
+                ).first
+                if await close_btn.is_visible(timeout=1000):
+                    await close_btn.click()
+                    await _delay(400, 700)
         except Exception:
             pass
 
         # Новый формат hh.ru: «Резюме доставлено» — резюме уже отправлено,
-        # но письмо можно добавить в поле ниже
+        # но на этой же странице могут быть скрининговые вопросы — заполняем их тоже.
+        # Важно: проверяем что элемент ВИДЕН, а не просто есть в HTML (избегаем false-positive).
         try:
-            content = await self.page.content()
-            if "Резюме доставлено" in content or "Resume delivered" in content:
+            delivered = self.page.locator(
+                "text=Резюме доставлено, text=Resume delivered"
+            ).first
+            if await delivered.is_visible(timeout=1000):
+                from config import RESUME
+                await self._fill_screening_questions(RESUME)
                 await self._fill_cover_letter_if_present(cover_letter)
                 await self.save_session()
                 return "applied", "", ""
@@ -444,10 +475,10 @@ class HHBrowserClient:
 
         # Если на странице уже есть «Вы откликнулись» — успех
         try:
-            content = await self.page.content()
-            if any(t in content for t in ["Вы откликнулись", "Отклик отправлен", "уже откликались"]):
-                await self.save_session()
-                return "applied", "", ""
+            for phrase in ["Вы откликнулись", "Отклик отправлен", "уже откликались"]:
+                if await self.page.locator(f"text={phrase}").first.is_visible(timeout=500):
+                    await self.save_session()
+                    return "applied", "", ""
         except Exception:
             pass
 
@@ -518,11 +549,8 @@ class HHBrowserClient:
         await self.page.screenshot(path=f"screenshots/apply_{tag}_step3.png")
 
         # --- Скрининговые вопросы работодателя ---
-        try:
-            from config import RESUME
-            await self._fill_screening_questions(RESUME)
-        except Exception as e:
-            print(f"    ⚠ Ошибка заполнения анкеты: {e}")
+        from config import RESUME
+        await self._fill_screening_questions(RESUME)
 
         # --- Сопроводительное письмо ---
         try:
@@ -662,10 +690,29 @@ class HHBrowserClient:
             except Exception:
                 continue
 
+    async def _collect_negotiations_paginated(
+        self, negotiations: list, seen_ids: set, base_tab_url: str
+    ) -> int:
+        """Собирает переговоры со всех страниц вкладки (пагинация через &page=N)."""
+        added_total = 0
+        sep = "&" if "?" in base_tab_url else "?"
+        for page_idx in range(0, 50):  # максимум 50 страниц
+            page_url = f"{base_tab_url}{sep}page={page_idx}" if page_idx > 0 else base_tab_url
+            if page_idx > 0:
+                await self.page.goto(page_url, wait_until="domcontentloaded")
+                await _delay(1200, 2000)
+            before = len(negotiations)
+            await self._collect_negotiations_from_page(negotiations, seen_ids, page_url)
+            added = len(negotiations) - before
+            added_total += added
+            if added == 0:
+                break  # страница пустая — конец пагинации
+        return added_total
+
     async def get_negotiations(self) -> list[dict]:
         """
         Список переговоров где доступен чат ("Перейти в чат").
-        Проверяет все вкладки (Активные, Ожидание, и др.).
+        Проверяет все вкладки (Активные, Ожидание, и др.) с пагинацией.
         Возвращает [{id, url, tab_url, vacancy.name, employer.name}]
         """
         main_url = f"{BASE_URL}/applicant/negotiations"
@@ -676,8 +723,8 @@ class HHBrowserClient:
         negotiations: list = []
         seen_ids: set = set()
 
-        # Собираем с текущей (главной) вкладки
-        await self._collect_negotiations_from_page(negotiations, seen_ids, main_url)
+        # Собираем с текущей (главной) вкладки + пагинация
+        main_added = await self._collect_negotiations_paginated(negotiations, seen_ids, main_url)
 
         # Находим ссылки на другие вкладки переговоров
         tab_links = await self.page.locator("a[href*='/applicant/negotiations']").all()
@@ -691,14 +738,14 @@ class HHBrowserClient:
                 tab_urls.append(full)
 
         print(f"  Вкладки переговоров: {[u.split('/')[-1] for u in tab_urls] or ['только главная']}")
+        if main_added:
+            print(f"    [главная] {main_added} чатов")
 
         for tab_url in tab_urls:
             try:
                 await self.page.goto(tab_url, wait_until="domcontentloaded")
                 await _delay(1500, 2500)
-                before = len(negotiations)
-                await self._collect_negotiations_from_page(negotiations, seen_ids, tab_url)
-                added = len(negotiations) - before
+                added = await self._collect_negotiations_paginated(negotiations, seen_ids, tab_url)
                 if added:
                     print(f"    [{tab_url.split('/')[-1]}] +{added} чатов")
             except Exception:
@@ -713,7 +760,7 @@ class HHBrowserClient:
         Возвращает Frame chatik или None.
         """
         target = tab_url or f"{BASE_URL}/applicant/negotiations"
-        if target not in self.page.url:
+        if self.page.url != target:
             await self.page.goto(target, wait_until="domcontentloaded")
             await _delay(2500, 3500)
 
@@ -910,15 +957,20 @@ class HHBrowserClient:
         """
         Обнаруживает скрининговые вопросы работодателя, отвечает на них через Claude.
         Возвращает True если вопросы найдены и заполнены.
+        Бросает StopOnFail если вопрос не удалось заполнить — для ручного разбора.
         """
         from ai.responder import answer_screening_questions
+        from core.exceptions import StopOnFail
 
         # Ищем блоки с вопросами — hh.ru оборачивает их в fieldset или [data-qa='task-body']
         question_blocks = await self.page.locator(
             "[data-qa='task-body'], "
             "fieldset[class*='question'], "
             "[class*='taskBody'], "
-            "[class*='screening-question']"
+            "[class*='screening-question'], "
+            "fieldset, "
+            "[data-qa*='question'], "
+            "[class*='Question']"
         ).all()
 
         if not question_blocks:
@@ -975,12 +1027,26 @@ class HHBrowserClient:
             qid = q["id"]
             answer = answers.get(qid, "")
             if not answer:
-                continue
+                raise StopOnFail(
+                    f"Вопрос без ответа: [{q['text'][:80]}] (тип: {q['type']}) — "
+                    f"Claude не смог ответить. Разберите вручную."
+                )
+            # Детект мусорных ответов — Claude признал что не знает
+            garbage_markers = [
+                "информация отсутствует", "не указано", "уточните",
+                "не содержит", "отсутствует в", "нет информации",
+                "не могу ответить", "данные отсутствуют",
+            ]
+            if any(m in answer.lower() for m in garbage_markers):
+                raise StopOnFail(
+                    f"Вопрос [{q['text'][:80]}]: Claude дал мусорный ответ: «{answer[:100]}». "
+                    f"Разберите вручную."
+                )
 
             block = question_blocks[q["_block_idx"]]
             try:
                 if q["type"] == "radio":
-                    # Ищем радио с совпадающим значением или label
+                    clicked = False
                     for opt in await block.locator("input[type='radio']").all():
                         val = await opt.get_attribute("value") or ""
                         opt_id = await opt.get_attribute("id") or ""
@@ -992,7 +1058,13 @@ class HHBrowserClient:
                         if answer.lower() in val.lower() or answer.lower() in label_text.lower():
                             await opt.click()
                             await _delay(200, 400)
+                            clicked = True
                             break
+                    if not clicked:
+                        raise StopOnFail(
+                            f"Radio-вопрос [{q['text'][:80]}]: ответ '{answer}' не совпал ни с одной опцией {q.get('options')}. "
+                            f"Разберите вручную."
+                        )
 
                 elif q["type"] in ("textarea", "text"):
                     field = block.locator("textarea, input[type='text'], input:not([type])").first
@@ -1001,8 +1073,11 @@ class HHBrowserClient:
 
                 elif q["type"] == "number":
                     field = block.locator("input[type='number']").first
-                    # Извлекаем только цифры
                     num = re.sub(r"[^\d]", "", answer)
+                    if not num:
+                        raise StopOnFail(
+                            f"Number-вопрос [{q['text'][:80]}]: ответ '{answer}' не содержит цифр. Разберите вручную."
+                        )
                     await field.fill(num)
                     await _delay(200, 400)
 
@@ -1012,10 +1087,19 @@ class HHBrowserClient:
                     await _delay(200, 400)
 
                 print(f"    → [{q['text'][:40]}] → {answer[:60]}")
+            except StopOnFail:
+                raise
             except Exception as e:
-                print(f"    ⚠ Не удалось заполнить вопрос {qid}: {e}")
+                raise StopOnFail(
+                    f"Не удалось заполнить вопрос [{q['text'][:80]}] (тип: {q['type']}): {e}"
+                ) from e
 
-        return True
+        filled = [
+            {"question": q["text"], "answer": answers.get(q["id"], "")}
+            for q in questions
+        ]
+        self._last_screening_answers = filled
+        return filled
 
     async def _fill_cover_letter_if_present(self, cover_letter: str) -> None:
         """Заполняет и отправляет сопроводительное письмо если поле присутствует на странице."""
@@ -1057,7 +1141,8 @@ class HHBrowserClient:
         for sel in indicators:
             if await self.page.locator(sel).count():
                 print("\n⚠  CAPTCHA! Решите её вручную в браузере, затем нажмите Enter здесь...")
-                input()
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, input)
                 await _delay(1000, 2000)
                 break
 
