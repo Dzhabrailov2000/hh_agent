@@ -448,7 +448,7 @@ async def run_chat_step(
                     try:
                         await client.click_quick_reply(neg_url, value, tab_url=neg_tab)
                         print(f"    → ✓ Кнопка нажата")
-                        summary_auto.append({"company": employer_name, "vacancy": vacancy_name, "action": f"кнопка «{value}»"})
+                        summary_auto.append({"company": employer_name, "vacancy": vacancy_name, "action": f"кнопка «{value}»", "response": f"кнопка: «{value}»"})
                         await asyncio.sleep(1.5)
                     except Exception as e:
                         print(f"    → ✗ {e}")
@@ -507,7 +507,7 @@ async def run_chat_step(
                     try:
                         await client.send_message(neg_url, answer, tab_url=neg_tab)
                         print(f"    → ✓ Ответ отправлен")
-                        summary_auto.append({"company": employer_name, "vacancy": vacancy_name, "action": "AI-ответ"})
+                        summary_auto.append({"company": employer_name, "vacancy": vacancy_name, "action": "AI-ответ", "response": answer[:300]})
                         await asyncio.sleep(1.5)
                     except Exception as e:
                         print(f"    → ✗ {e}")

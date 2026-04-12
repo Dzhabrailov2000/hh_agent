@@ -61,7 +61,10 @@ async def send_chat_summary(
     if auto_replied:
         lines.append(f"*Авто\\-ответы* \\({len(auto_replied)}\\):")
         for item in auto_replied:
-            lines.append(f"  • {_esc(item['company'])} — {_esc(item['vacancy'])}: _{_esc(item['action'])}_")
+            lines.append(f"  • {_esc(item['company'])} — {_esc(item['vacancy'])}")
+            response = item.get("response", "")
+            if response:
+                lines.append(f"    _{_esc(response)}_")
     if notified:
         if auto_replied:
             lines.append("")
